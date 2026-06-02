@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <cstring>
+#include <print>
 
 
 bool ReactorEngine::init() {
@@ -69,7 +70,8 @@ bool ReactorEngine::init() {
     }
 
     epoll_event ev;
-    ev.events = EPOLLIN;
+    // might add epollet later 
+    ev.events = EPOLLIN | EPOLLET;
     ev.data.fd = listener_fd;
 
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listener_fd, &ev) < 0) {
@@ -96,17 +98,24 @@ void ReactorEngine::run() {
 
         for (int i = 0; i < numEvents; ++i) {
             int eventTriggered = e_event[i].data.fd;
-            int eventType = e_event[i].events;
+            std::uint32_t eventType = e_event[i].events;
 
             if (eventTriggered == listener_fd) {
                 if (eventType & EPOLLIN) {
                     acceptNewClients();
                 }
-            }  else if (eventType & EPOLLIN) {
-                //this function might need a return from acceptNewClients or access from the arrays
-                //handleClient();
-            } else if (eventType & (EPOLLERR | EPOLLHUP) ) {
+                continue;
+            } 
+            
+             
+            if (eventType & (EPOLLERR | EPOLLHUP) ) {
+                std::print("Error or Hangup on fd, {}", eventTriggered);
                 //disconnectClients();
+                continue;
+            }
+
+            if (eventType & EPOLLIN) {
+                handleClient(eventTriggered);
             }
 
         }
@@ -115,6 +124,8 @@ void ReactorEngine::run() {
     
 }
 
+
+//acceptNewClients() should ideally detect EAGAIN/EWOULDBLOCK explicitly, not just rely on loop exit.
 void ReactorEngine::acceptNewClients() {
 
     // this is to store info like ip and port 
@@ -125,34 +136,72 @@ void ReactorEngine::acceptNewClients() {
 
     while ((sfd = accept(listener_fd, (struct sockaddr *)&clientAddr, &addr_size)) >= 0) {
 
+        int flags = fcntl(sfd, F_GETFL, 0);
+        fcntl(sfd, F_SETFL, flags | O_NONBLOCK);
+
+
         int freeSlot = freeSlots.top();
         freeSlots.pop();
 
         clientSession[freeSlot].sfd = sfd;
         clientSession[freeSlot].isActive = true;
-        fdsToSlot[clientSession[freeSlot].sfd] = freeSlot;
+        fdsToSlot[sfd] = freeSlot;
 
+        struct epoll_event ev;
 
-        std::cerr << "[DEBUG] accepted sfd=" << sfd
-          << " assigned slot=" << freeSlot
-          << " mapped fdsToSlot[" << sfd << "]=" << fdsToSlot[sfd]
-          << std::endl;
-    
+        std::memset(&ev, 0, sizeof(ev));
 
-        std::cerr << "[DEBUG] session[" << freeSlot << "]: "
-          << "sfd=" << clientSession[freeSlot].sfd
-          << " isActive=" << clientSession[freeSlot].isActive
-          << std::endl;
+        ev.events = EPOLLIN | EPOLLET;
+        ev.data.fd = sfd;
 
-          if (fdsToSlot[sfd] != freeSlot) {
-        std::cerr << "[ERROR] slot mismatch! expected "
-              << freeSlot << " got " << fdsToSlot[sfd]
-              << std::endl;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sfd, &ev) == -1) {
+            perror("epoll_ctl: EPOLL_CTL_ADD failed");
+        
+            clientSession[freeSlot].isActive = false;
+            clientSession[freeSlot].sfd = -1;
+            fdsToSlot[sfd] = -1;
+            freeSlots.push(freeSlot);
+            close(sfd);
         }
 
     }
 
+}
 
+void ReactorEngine::handleClient(int fd) {
+
+    ClientSession& client = clientSession[fdsToSlot[fd]];
+
+    if (client.isActive) {
+
+        while (true) {
+
+            client.bytesInBuffer = recv(client.sfd, client.readBuffer, sizeof(client.readBuffer), 0);
+
+            if (client.bytesInBuffer > 0) {
+                // this could possibly change back to a char as client.readbuffer - 1
+                std::string_view msg(reinterpret_cast<const char*>(client.readBuffer), client.bytesInBuffer);
+                std::print("client said: {}", msg);
+                //printf("client said: %s\n");
+
+            } else if (client.bytesInBuffer == 0) {
+                std::print("client disconnected gracefully");
+                //printf("client disconnected gracefully\n");
+                break;
+            } else {
+                if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                    break;
+                    // fake error
+                } else {
+                    std::print("REAL ERROR CODE: {}", errno);
+                    //printf("real error\n");
+                    break;
+                }
+            }
+
+        }
+
+    }
 
 }
 
