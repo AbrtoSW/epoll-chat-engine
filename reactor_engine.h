@@ -3,7 +3,7 @@
 #include "constants.h"
 #include "types.h"
 
-#include <stack>
+#include <vector>
 #include <string_view>
 #include <cstdint>
 
@@ -28,12 +28,14 @@ class ReactorEngine {
     
     bool isActive{};
 
-    ClientSession clientSession[CONSTANTS::MAX_FDS];
-    std::uint32_t fdsToSlot[CONSTANTS::MAX_FDS];
-    std::stack<std::uint32_t> freeSlots{}; 
+    std::vector<ClientSession> clientSession;
+    std::vector<std::uint32_t> fdsToSlot;
+    std::vector<std::uint32_t> freeSlots;
+
 
     void acceptNewClients();
-    void disconnectClients();
+    void disconnectClients(int fd);
     void broadcastMessage(int sender_fd, std::string_view message);
     void handleClient(int fd);
+    std::size_t parseBuffer(const ClientSession& client, std::uint8_t data, std::size_t dataSize); 
 };

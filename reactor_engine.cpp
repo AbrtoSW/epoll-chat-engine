@@ -8,7 +8,7 @@
 #include <sys/epoll.h>
 #include <cstring>
 #include <print>
-
+#include <sys/resource.h>
 
 bool ReactorEngine::init() {
 
@@ -106,17 +106,17 @@ void ReactorEngine::run() {
                 }
                 continue;
             } 
-            
-             
-            if (eventType & (EPOLLERR | EPOLLHUP) ) {
-                std::print("Error or Hangup on fd, {}", eventTriggered);
-                //disconnectClients();
+
+            if (eventType & (EPOLLHUP | EPOLLERR)) {
+                disconnectClients(eventTriggered);
                 continue;
             }
 
             if (eventType & EPOLLIN) {
                 handleClient(eventTriggered);
             }
+            
+
 
         }
         
@@ -125,7 +125,6 @@ void ReactorEngine::run() {
 }
 
 
-//acceptNewClients() should ideally detect EAGAIN/EWOULDBLOCK explicitly, not just rely on loop exit.
 void ReactorEngine::acceptNewClients() {
 
     // this is to store info like ip and port 
@@ -139,13 +138,20 @@ void ReactorEngine::acceptNewClients() {
         int flags = fcntl(sfd, F_GETFL, 0);
         fcntl(sfd, F_SETFL, flags | O_NONBLOCK);
 
+        if (freeSlots.empty()) {
+            std::print("acceptNewClients: accepted fd {} but no free slots available, closing\n", sfd);
+            close(sfd);
+            continue;
+        }
 
-        int freeSlot = freeSlots.top();
-        freeSlots.pop();
+        int freeSlot = freeSlots.back();
+        freeSlots.pop_back();
 
         clientSession[freeSlot].sfd = sfd;
         clientSession[freeSlot].isActive = true;
         fdsToSlot[sfd] = freeSlot;
+
+        std::print("acceptNewClients: accepted fd {} mapped to slot {}, freeSlots={}\n", sfd, freeSlot, freeSlots.size());
 
         struct epoll_event ev;
 
@@ -160,7 +166,7 @@ void ReactorEngine::acceptNewClients() {
             clientSession[freeSlot].isActive = false;
             clientSession[freeSlot].sfd = -1;
             fdsToSlot[sfd] = -1;
-            freeSlots.push(freeSlot);
+            freeSlots.push_back(freeSlot);
             close(sfd);
         }
 
@@ -169,29 +175,66 @@ void ReactorEngine::acceptNewClients() {
 }
 
 void ReactorEngine::handleClient(int fd) {
+    //this will be multhireaded but first testing single thread
+    std::uint32_t slot = fdsToSlot[fd];
+    if (slot == CONSTANTS::INVALID_SLOT) {
+        std::print("handleClient: fd {} has invalid slot\n", fd);
+        return;
+    }
 
-    ClientSession& client = clientSession[fdsToSlot[fd]];
+    ClientSession& client = clientSession[slot];
+    if (!client.isActive || client.sfd != fd) {
+        std::print("handleClient: fd {} mapped to slot {} but session inactive or sfd mismatch (session.sfd={})\n", fd, slot, client.sfd);
+        disconnectClients(fd);
+        return;
+    }
 
     if (client.isActive) {
 
         while (true) {
 
-            client.bytesInBuffer = recv(client.sfd, client.readBuffer, sizeof(client.readBuffer), 0);
+            std::uint8_t readBuffer[4096];
+            ssize_t bytesInBuffer = recv(client.sfd, readBuffer, sizeof(readBuffer), 0);
 
-            if (client.bytesInBuffer > 0) {
-                // this could possibly change back to a char as client.readbuffer - 1
-                std::string_view msg(reinterpret_cast<const char*>(client.readBuffer), client.bytesInBuffer);
-                std::print("client said: {}", msg);
-                //printf("client said: %s\n");
+            if (bytesInBuffer > 0) {
 
-            } else if (client.bytesInBuffer == 0) {
-                std::print("client disconnected gracefully");
-                //printf("client disconnected gracefully\n");
+                if (client.pending && !client.pending->empty()) {
+
+                    client.pending->insert(client.pending->end(), readBuffer, readBuffer + bytesInBuffer);
+                    std::size_t bytesProcessed = parseBuffer(client, *client.pending->data(), client.pending->size());
+
+                    if (bytesProcessed > 0) {
+                    // Erase processed bytes from the front of the vector
+                        client.pending->erase(client.pending->begin(), client.pending->begin() + bytesProcessed);
+                    }
+
+                } else {
+
+                    std::size_t bytesProccessed = parseBuffer(client, *readBuffer, bytesInBuffer);
+
+                    if (bytesProccessed < static_cast<std::size_t>(bytesInBuffer)) {
+
+                        if (!client.pending) {
+                            client.pending = std::make_unique<std::vector<std::uint8_t>>();
+                        }
+
+                        client.pending->insert(client.pending->end(), readBuffer + bytesProccessed, readBuffer + bytesInBuffer);
+                    }
+
+                    //either make the printing inside the parser or out here see which is cleaner 
+
+                }
+
+                
+
+            } else if (bytesInBuffer == 0) {
+                disconnectClients(client.sfd);
                 break;
             } else {
                 if (errno == EWOULDBLOCK || errno == EAGAIN) {
                     break;
                     // fake error
+                    // should i disconnct?
                 } else {
                     std::print("REAL ERROR CODE: {}", errno);
                     //printf("real error\n");
@@ -205,11 +248,51 @@ void ReactorEngine::handleClient(int fd) {
 
 }
 
-void ReactorEngine::initializeDataHolders() {
 
+void ReactorEngine::disconnectClients(int fd){
 
-    for (int i = 0; i < CONSTANTS::MAX_FDS; ++i) {
-        freeSlots.push(i);
+    int slot = fdsToSlot[fd];
+    std::print("disconnecting fd {} slot {}\n", fd, slot);
+    if (slot == CONSTANTS::INVALID_SLOT) {
+        std::print("disconnectClients: fd {} already invalid\n", fd);
+        return;
+    }
+    if (clientSession[slot].sfd != fd) {
+        std::print("disconnectClients: fd {} mapped to slot {} but session.sfd={}\n", fd, slot, clientSession[slot].sfd);
     }
 
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+    close(fd);
+    clientSession[slot].isActive = false;
+    clientSession[slot].sfd = -1;
+    fdsToSlot[fd] = CONSTANTS::INVALID_SLOT;
+    freeSlots.push_back(slot);
+    std::print("disconnectClients: fd {} slot {} cleaned up, freeSlots={}\n", fd, slot, freeSlots.size());
+
+}
+
+void ReactorEngine::initializeDataHolders() {
+
+    struct rlimit rl;
+    if(getrlimit(RLIMIT_NOFILE, &rl) < 0) {
+        std::cerr << "getrlimit failed\n";
+        rl.rlim_cur = RLimitDefaults::fallBackDefault; 
+    }
+
+    std::size_t fdMax = rl.rlim_cur;
+    std::print("Initializing fdsToSlot for max_fd={}\n", fdMax);
+
+
+    clientSession.resize(CONSTANTS::MAX_CLIENTS);
+    fdsToSlot.assign(fdMax, CONSTANTS::INVALID_SLOT);
+    freeSlots.reserve(CONSTANTS::MAX_CLIENTS);
+
+    for (int i = 0; i < CONSTANTS::MAX_CLIENTS; ++i) {
+        freeSlots.push_back(i);
+    }
+
+}
+
+std::size_t ReactorEngine::parseBuffer(const ClientSession& client, std::uint8_t data, std::size_t dataSize) {
+    return -1;
 }
