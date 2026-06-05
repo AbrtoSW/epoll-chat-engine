@@ -35,7 +35,8 @@ class ReactorEngine {
 
     void acceptNewClients();
     void disconnectClients(int fd);
-    void broadcastMessage(int sender_fd, std::string_view message);
+    void broadcastMessage(int sender_fd, std::string_view msg);
     void handleClient(int fd);
-    std::size_t parseBuffer(const ClientSession& client, std::uint8_t data, std::size_t dataSize); 
+    std::size_t parseBuffer(int sender_fd, std::uint8_t* data, std::size_t dataSize); 
+    void handleMessage(int sender_fd, const uint8_t* payload, std::size_t sizeOfPayload);
 };

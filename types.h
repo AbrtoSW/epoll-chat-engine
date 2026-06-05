@@ -10,7 +10,7 @@ namespace RLimitDefaults {
 };
 
 struct ClientSession {
-
+    std::uint32_t uniqueID;
     std::int32_t sfd{-1};
     std::unique_ptr<std::vector<std::uint8_t>> pending;  
     bool isActive{false};

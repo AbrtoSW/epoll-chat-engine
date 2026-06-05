@@ -197,32 +197,27 @@ void ReactorEngine::handleClient(int fd) {
             ssize_t bytesInBuffer = recv(client.sfd, readBuffer, sizeof(readBuffer), 0);
 
             if (bytesInBuffer > 0) {
+                std::print("handleClient: fd {} recv {} bytes\n", client.sfd, bytesInBuffer);
 
                 if (client.pending && !client.pending->empty()) {
-
                     client.pending->insert(client.pending->end(), readBuffer, readBuffer + bytesInBuffer);
-                    std::size_t bytesProcessed = parseBuffer(client, *client.pending->data(), client.pending->size());
+                    std::size_t bytesProcessed = parseBuffer(client.sfd, client.pending->data(), client.pending->size());
 
                     if (bytesProcessed > 0) {
-                    // Erase processed bytes from the front of the vector
+                        // Erase processed bytes from the front of the vector
                         client.pending->erase(client.pending->begin(), client.pending->begin() + bytesProcessed);
                     }
 
                 } else {
+                    std::size_t bytesProcessed = parseBuffer(client.sfd, readBuffer, bytesInBuffer);
 
-                    std::size_t bytesProccessed = parseBuffer(client, *readBuffer, bytesInBuffer);
-
-                    if (bytesProccessed < static_cast<std::size_t>(bytesInBuffer)) {
-
+                    if (bytesProcessed < static_cast<std::size_t>(bytesInBuffer)) {
                         if (!client.pending) {
                             client.pending = std::make_unique<std::vector<std::uint8_t>>();
                         }
 
-                        client.pending->insert(client.pending->end(), readBuffer + bytesProccessed, readBuffer + bytesInBuffer);
+                        client.pending->insert(client.pending->end(), readBuffer + bytesProcessed, readBuffer + bytesInBuffer);
                     }
-
-                    //either make the printing inside the parser or out here see which is cleaner 
-
                 }
 
                 
@@ -293,6 +288,49 @@ void ReactorEngine::initializeDataHolders() {
 
 }
 
-std::size_t ReactorEngine::parseBuffer(const ClientSession& client, std::uint8_t data, std::size_t dataSize) {
-    return -1;
+std::size_t ReactorEngine::parseBuffer(int sender_fd, std::uint8_t* data, std::size_t dataSize) {
+
+    std::size_t offset = 0;
+
+    while (offset + 4 <= dataSize) {
+        std::uint32_t rawMsgLength;
+        std::memcpy(&rawMsgLength, data + offset, sizeof(rawMsgLength));
+        std::uint32_t msgLength = ntohl(rawMsgLength);
+
+        if (msgLength == 0 || msgLength > CONSTANTS::MAX_MESSAGE_SIZE) {
+            std::print("parseBuffer: invalid msgLength={} from sender {}\n", msgLength, sender_fd);
+            return 0;
+        }
+
+         // message isnt complete therefore we return offset 
+        if (offset + 4 + msgLength > dataSize) {
+            std::print("parseBuffer: incomplete frame from sender {} (need {} bytes, have {})\n",
+                       sender_fd, offset + 4 + msgLength, dataSize);
+            break;
+        }
+
+        std::print("parseBuffer: complete frame from sender {} length={}\n", sender_fd, msgLength);
+        handleMessage(sender_fd, data + offset + 4, msgLength);
+        offset += msgLength + 4;
+    }
+
+    return offset;
 }
+
+
+// this func to handle actual msg data in its raw byte form
+void ReactorEngine::handleMessage(int sender_fd, const uint8_t* payload, std::size_t sizeOfPayload){
+
+    std::string_view msg(reinterpret_cast<const char*>(payload), sizeOfPayload);
+    broadcastMessage(sender_fd, msg);
+
+}
+
+
+void ReactorEngine::broadcastMessage(int sender_fd, std::string_view msg) {
+    std::print("Client #{} said: {}\n", sender_fd, msg);
+}
+
+
+
+
